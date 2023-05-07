@@ -9,5 +9,6 @@ It can bring back the global IP ID counter which is set in each network namespac
 This patch is intended for research use only.
 
 ## Alternatives
-Older Windows OS (like XP)
+Older Windows OS (e.g. XP)
+
 FreeBSD 13 with ip_do_randomid and ip_rfc6864 disabled on a single-threaded machine.
