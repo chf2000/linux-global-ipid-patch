@@ -1,0 +1,181 @@
+diff --git a/include/net/ip.h b/include/net/ip.h
+index c3fffaa92d6e..43fc10bed96e 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -526,20 +526,20 @@ static inline void ip_select_ident_segs(struct net *net, struct sk_buff *skb,
+ {
+ 	struct iphdr *iph = ip_hdr(skb);
+ 
+-	/* We had many attacks based on IPID, use the private
+-	 * generator as much as we can.
+-	 */
+-	if (sk && inet_sk(sk)->inet_daddr) {
+-		iph->id = htons(inet_sk(sk)->inet_id);
+-		inet_sk(sk)->inet_id += segs;
+-		return;
+-	}
+-	if ((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) {
+-		iph->id = 0;
+-	} else {
+-		/* Unfortunately we need the big hammer to get a suitable IPID */
+-		__ip_select_ident(net, iph, segs);
+-	}
++	// /* We had many attacks based on IPID, use the private
++	//  * generator as much as we can.
++	//  */
++	// if (sk && inet_sk(sk)->inet_daddr) {
++	// 	iph->id = htons(inet_sk(sk)->inet_id);
++	// 	inet_sk(sk)->inet_id += segs;
++	// 	return;
++	// }
++	// if ((iph->frag_off & htons(IP_DF)) && !skb->ignore_df) {
++	// 	iph->id = 0;
++	// } else {
++	// 	/* Unfortunately we need the big hammer to get a suitable IPID */
++	__ip_select_ident(net, iph, segs);
++	// }
+ }
+ 
+ static inline void ip_select_ident(struct net *net, struct sk_buff *skb,
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index db762e35aca9..9b47a18ff5bc 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -237,5 +237,6 @@ struct netns_ipv4 {
+ 
+ 	atomic_t	rt_genid;
+ 	siphash_key_t	ip_id_key;
++	atomic_t global_ip_id;
+ };
+ #endif
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index 7b69cf882b8e..47077114bc81 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -333,6 +333,7 @@ static __net_init int setup_net(struct net *net, struct user_namespace *user_ns)
+ 	idr_init(&net->netns_ids);
+ 	spin_lock_init(&net->nsid_lock);
+ 	mutex_init(&net->ipv4.ra_mutex);
++	atomic_set(&net->ipv4.global_ip_id, 0);
+ 
+ 	list_for_each_entry(ops, &pernet_list, list) {
+ 		error = ops_init(ops, net);
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 4e4e308c3230..b3df2ddf0573 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -162,20 +162,20 @@ int ip_build_and_send_pkt(struct sk_buff *skb, const struct sock *sk,
+ 	iph->daddr    = (opt && opt->opt.srr ? opt->opt.faddr : daddr);
+ 	iph->saddr    = saddr;
+ 	iph->protocol = sk->sk_protocol;
+-	/* Do not bother generating IPID for small packets (eg SYNACK) */
+-	if (skb->len <= IPV4_MIN_MTU || ip_dont_fragment(sk, &rt->dst)) {
+-		iph->frag_off = htons(IP_DF);
+-		iph->id = 0;
+-	} else {
+-		iph->frag_off = 0;
+-		/* TCP packets here are SYNACK with fat IPv4/TCP options.
+-		 * Avoid using the hashed IP ident generator.
+-		 */
+-		if (sk->sk_protocol == IPPROTO_TCP)
+-			iph->id = (__force __be16)get_random_u16();
+-		else
+-			__ip_select_ident(net, iph, 1);
+-	}
++	// /* Do not bother generating IPID for small packets (eg SYNACK) */
++	// if (skb->len <= IPV4_MIN_MTU || ip_dont_fragment(sk, &rt->dst)) {
++	// 	iph->frag_off = htons(IP_DF);
++	// 	iph->id = 0;
++	// } else {
++	// 	iph->frag_off = 0;
++	// 	/* TCP packets here are SYNACK with fat IPv4/TCP options.
++	// 	 * Avoid using the hashed IP ident generator.
++	// 	 */
++	// 	if (sk->sk_protocol == IPPROTO_TCP)
++	// 		iph->id = (__force __be16)get_random_u16();
++	// 	else
++	__ip_select_ident(net, iph, 1);
++	// }
+ 
+ 	if (opt && opt->opt.optlen) {
+ 		iph->ihl += opt->opt.optlen>>2;
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index de6e3515ab4f..af832a9bba7e 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -458,42 +458,44 @@ static u32 *ip_tstamps __read_mostly;
+  * if one generator is seldom used. This makes hard for an attacker
+  * to infer how many packets were sent between two points in time.
+  */
+-static u32 ip_idents_reserve(u32 hash, int segs)
+-{
+-	u32 bucket, old, now = (u32)jiffies;
+-	atomic_t *p_id;
+-	u32 *p_tstamp;
+-	u32 delta = 0;
+-
+-	bucket = hash & ip_idents_mask;
+-	p_tstamp = ip_tstamps + bucket;
+-	p_id = ip_idents + bucket;
+-	old = READ_ONCE(*p_tstamp);
+-
+-	if (old != now && cmpxchg(p_tstamp, old, now) == old)
+-		delta = get_random_u32_below(now - old);
+-
+-	/* If UBSAN reports an error there, please make sure your compiler
+-	 * supports -fno-strict-overflow before reporting it that was a bug
+-	 * in UBSAN, and it has been fixed in GCC-8.
+-	 */
+-	return atomic_add_return(segs + delta, p_id) - segs;
+-}
++// static u32 ip_idents_reserve(u32 hash, int segs)
++// {
++// 	u32 bucket, old, now = (u32)jiffies;
++// 	atomic_t *p_id;
++// 	u32 *p_tstamp;
++// 	u32 delta = 0;
++
++// 	bucket = hash & ip_idents_mask;
++// 	p_tstamp = ip_tstamps + bucket;
++// 	p_id = ip_idents + bucket;
++// 	old = READ_ONCE(*p_tstamp);
++
++// 	if (old != now && cmpxchg(p_tstamp, old, now) == old)
++// 		delta = get_random_u32_below(now - old);
++
++// 	/* If UBSAN reports an error there, please make sure your compiler
++// 	 * supports -fno-strict-overflow before reporting it that was a bug
++// 	 * in UBSAN, and it has been fixed in GCC-8.
++// 	 */
++// 	return atomic_add_return(segs + delta, p_id) - segs;
++// }
+ 
+ void __ip_select_ident(struct net *net, struct iphdr *iph, int segs)
+ {
+-	u32 hash, id;
++	// u32 hash, id;
+ 
+-	/* Note the following code is not safe, but this is okay. */
+-	if (unlikely(siphash_key_is_zero(&net->ipv4.ip_id_key)))
+-		get_random_bytes(&net->ipv4.ip_id_key,
+-				 sizeof(net->ipv4.ip_id_key));
++	// /* Note the following code is not safe, but this is okay. */
++	// if (unlikely(siphash_key_is_zero(&net->ipv4.ip_id_key)))
++	// 	get_random_bytes(&net->ipv4.ip_id_key,
++	// 			 sizeof(net->ipv4.ip_id_key));
+ 
+-	hash = siphash_3u32((__force u32)iph->daddr,
+-			    (__force u32)iph->saddr,
+-			    iph->protocol,
+-			    &net->ipv4.ip_id_key);
+-	id = ip_idents_reserve(hash, segs);
++	// hash = siphash_3u32((__force u32)iph->daddr,
++	// 		    (__force u32)iph->saddr,
++	// 		    iph->protocol,
++	// 		    &net->ipv4.ip_id_key);
++	// id = ip_idents_reserve(hash, segs);
++	u32 id = (u32) atomic_read(&net->ipv4.global_ip_id);
++	atomic_inc(&net->ipv4.global_ip_id);
+ 	iph->id = htons(id);
+ }
+ EXPORT_SYMBOL(__ip_select_ident);
